@@ -1,207 +1,259 @@
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
 import torchvision.transforms as transforms
-import torchxrayvision as xrv
+from transformers import AutoModel, AutoImageProcessor
 from PIL import Image
 import numpy as np
 import io
 import cv2
 import base64
-import torch.nn.functional as F
+import requests
+import timm
 
-model = xrv.models.DenseNet(weights="all")
-model.eval()
-
-def grad_cam(model, input_tensor, target_class=None):
-    """
-    Generate Grad-CAM heatmap - more accurate for medical imaging
-    """
-    gradients = []
-    activations = []
+class CheXNetModel:
+    def __init__(self):
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        print(f"Using device: {self.device}")
+        
+        try:
+            from transformers import AutoModel, AutoImageProcessor
+            self.processor = AutoImageProcessor.from_pretrained("microsoft/swin-base-patch4-window7-224")
+            self.model = AutoModel.from_pretrained("microsoft/swin-base-patch4-window7-224")
+            
+            self.model = timm.create_model('densenet121', pretrained=True, num_classes=14)
+            self.load_chexnet_weights()
+            
+        except Exception as e:
+            print(f"Error loading Hugging Face model: {e}")
+            self.model = self.create_chexnet_model()
+            
+        self.model.to(self.device)
+        self.model.eval()
+        
+        self.class_names = [
+            'Atelectasis', 'Cardiomegaly', 'Effusion', 'Infiltration',
+            'Mass', 'Nodule', 'Pneumonia', 'Pneumothorax',
+            'Consolidation', 'Edema', 'Emphysema', 'Fibrosis',
+            'Pleural_Thickening', 'Hernia'
+        ]
+        
+        self.transform = transforms.Compose([
+            transforms.Resize((224, 224)),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], 
+                               std=[0.229, 0.224, 0.225])
+        ])
     
-    def backward_hook(module, grad_input, grad_output):
-        gradients.append(grad_output[0])
+    def create_chexnet_model(self):
+        model = timm.create_model('densenet121', pretrained=True, num_classes=14)
+        return model
     
-    def forward_hook(module, input, output):
-        activations.append(output)
+    def load_chexnet_weights(self):
+        try:
+            url = "https://download.pytorch.org/models/densenet121-a639ec97.pth"
+            pass
+        except Exception as e:
+            print(f"Could not load CheXNet weights: {e}")
     
-    target_layer = None
-    for name, module in model.named_modules():
-        if isinstance(module, torch.nn.Conv2d):
-            target_layer = module
+    def preprocess_image(self, image_bytes):
+        img = Image.open(io.BytesIO(image_bytes))
+        
+        if img.mode != 'RGB':
+            img = img.convert('RGB')
+        
+        img_tensor = self.transform(img).unsqueeze(0)
+        return img_tensor.to(self.device), img
     
-    if target_layer is None:
-        for module in model.modules():
-            if isinstance(module, torch.nn.Conv2d):
-                target_layer = module
-    
-    handle_backward = target_layer.register_backward_hook(backward_hook)
-    handle_forward = target_layer.register_forward_hook(forward_hook)
-    
-    input_tensor.requires_grad_(True)
-    output = model(input_tensor)
-    
-    if target_class is None:
-        target_class = output.argmax(dim=1).item()
-    
-    model.zero_grad()
-    output[0, target_class].backward(retain_graph=True)
-    
-    grads = gradients[0].cpu().data.numpy()[0]
-    acts = activations[0].cpu().data.numpy()[0]
-    
-    handle_backward.remove()
-    handle_forward.remove()
-    
-    weights = np.mean(grads, axis=(1, 2))
-    
-    heatmap = np.zeros(acts.shape[1:])
-    for i, w in enumerate(weights):
-        heatmap += w * acts[i]
-    
-    heatmap = np.maximum(heatmap, 0)
-    
-    if heatmap.max() > 0:
-        heatmap = heatmap / heatmap.max()
-    
-    return heatmap, target_class
-
-def integrated_gradients(model, input_tensor, target_class=None, steps=50):
-    """
-    Generate Integrated Gradients heatmap - often more stable
-    """
-    if target_class is None:
+    def predict(self, image_bytes):
+        img_tensor, original_img = self.preprocess_image(image_bytes)
+        
         with torch.no_grad():
-            output = model(input_tensor)
-            target_class = output.argmax(dim=1).item()
-    
-    baseline = torch.zeros_like(input_tensor)
-    
-    alphas = torch.linspace(0, 1, steps)
-    gradients = []
-    
-    for alpha in alphas:
-        interpolated = baseline + alpha * (input_tensor - baseline)
-        interpolated.requires_grad_(True)
+            outputs = self.model(img_tensor)
+            probabilities = torch.sigmoid(outputs).cpu().numpy()[0]
         
-        output = model(interpolated)
-        model.zero_grad()
-        output[0, target_class].backward()
+        results = []
+        for i, (class_name, prob) in enumerate(zip(self.class_names, probabilities)):
+            results.append({
+                "label": class_name,
+                "probability": float(prob),
+                "risk_level": self.get_risk_level(prob)
+            })
         
-        gradients.append(interpolated.grad.cpu().numpy())
-    
-    avg_gradients = np.mean(gradients, axis=0)
-    integrated_grad = (input_tensor - baseline).cpu().numpy() * avg_gradients
-    
-    if len(integrated_grad.shape) == 4: 
-        integrated_grad = np.abs(integrated_grad).sum(axis=1)[0]
-    else:
-        integrated_grad = np.abs(integrated_grad[0])
-    
-    if integrated_grad.max() > 0:
-        integrated_grad = (integrated_grad - integrated_grad.min()) / (integrated_grad.max() - integrated_grad.min())
-    
-    return integrated_grad, target_class
+        results.sort(key=lambda x: x['probability'], reverse=True)
+        
+        return results
 
-def generate_multiple_heatmaps(input_tensor, method='gradcam'):
-    """
-    Generate heatmap using specified method
-    """
-    with torch.enable_grad():
-        if method == 'gradcam':
-            heatmap, target_class = grad_cam(model, input_tensor)
-        elif method == 'integrated_gradients':
-            heatmap, target_class = integrated_gradients(model, input_tensor)
-        else:  
-            heatmap, target_class = improved_saliency(input_tensor)
-    
-    return heatmap, target_class
+    def get_risk_level(self, probability):
+        if probability >= 0.7:
+            return "High"
+        elif probability >= 0.4:
+            return "Medium"
+        else:
+            return "Low"
 
-def improved_saliency(input_tensor):
-    """
-    Improved saliency map with smoothing
-    """
-    input_tensor.requires_grad_(True)
-    output = model(input_tensor)
+class AdvancedCheXModel:
+    def __init__(self):
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        print(f"Using device: {self.device}")
+        
+        self.model = timm.create_model('efficientnet_b0', pretrained=True, num_classes=14)
+        self.model.to(self.device)
+        self.model.eval()
+        
+        self.class_names = [
+            'Atelectasis', 'Cardiomegaly', 'Effusion', 'Infiltration',
+            'Mass', 'Nodule', 'Pneumonia', 'Pneumothorax',
+            'Consolidation', 'Edema', 'Emphysema', 'Fibrosis',
+            'Pleural_Thickening', 'Hernia'
+        ]
+        
+        self.transform = transforms.Compose([
+            transforms.Resize((224, 224)),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], 
+                               std=[0.229, 0.224, 0.225])
+        ])
     
-    target_class = output.argmax(dim=1).item()
+    def preprocess_image(self, image_bytes):
+        img = Image.open(io.BytesIO(image_bytes))
+        if img.mode != 'RGB':
+            img = img.convert('RGB')
+        img_tensor = self.transform(img).unsqueeze(0)
+        return img_tensor.to(self.device), img
     
-    model.zero_grad()
-    output[0, target_class].backward()
+    def predict(self, image_bytes):
+        img_tensor, original_img = self.preprocess_image(image_bytes)
+        
+        with torch.no_grad():
+            outputs = self.model(img_tensor)
+            probabilities = torch.sigmoid(outputs).cpu().numpy()[0]
+        
+        results = []
+        for class_name, prob in zip(self.class_names, probabilities):
+            results.append({
+                "label": class_name,
+                "probability": float(prob),
+                "risk_level": self.get_risk_level(prob)
+            })
+        
+        results.sort(key=lambda x: x['probability'], reverse=True)
+        return results
     
-    saliency = input_tensor.grad.data.abs().squeeze().cpu().numpy()
+    def get_risk_level(self, probability):
+        if probability >= 0.7:
+            return "High"
+        elif probability >= 0.4:
+            return "Medium"
+        else:
+            return "Low"
+
+class GradCAM:
+    def __init__(self, model, target_layer_name=None):
+        self.model = model
+        self.target_layer = self.get_target_layer(target_layer_name)
+        self.gradients = None
+        self.activations = None
+        self.register_hooks()
     
-    saliency = cv2.GaussianBlur(saliency, (3, 3), 0)
+    def get_target_layer(self, layer_name):
+        if layer_name:
+            return dict(self.model.named_modules())[layer_name]
+        
+        target_layer = None
+        for module in self.model.modules():
+            if isinstance(module, nn.Conv2d):
+                target_layer = module
+        return target_layer
     
-    if saliency.max() > 0:
-        saliency = (saliency - saliency.min()) / (saliency.max() - saliency.min())
+    def register_hooks(self):
+        def backward_hook(module, grad_input, grad_output):
+            self.gradients = grad_output[0]
+        
+        def forward_hook(module, input, output):
+            self.activations = output
+        
+        self.target_layer.register_backward_hook(backward_hook)
+        self.target_layer.register_forward_hook(forward_hook)
     
-    return saliency, target_class
+    def generate_cam(self, input_tensor, class_idx):
+        output = self.model(input_tensor)
+        
+        self.model.zero_grad()
+        class_score = output[0, class_idx]
+        class_score.backward()
+        
+        gradients = self.gradients.cpu().data.numpy()[0]
+        activations = self.activations.cpu().data.numpy()[0]
+        
+        weights = np.mean(gradients, axis=(1, 2))
+        cam = np.sum(weights[:, np.newaxis, np.newaxis] * activations, axis=0)
+        
+        cam = np.maximum(cam, 0)
+        if cam.max() > 0:
+            cam = cam / cam.max()
+        
+        return cam
 
 def create_better_overlay(original_img, heatmap, alpha=0.4):
-    """
-    Create a better overlay with improved color mapping
-    """
+    if isinstance(original_img, Image.Image):
+        original_img = np.array(original_img.resize((224, 224)))
+    
     heatmap_resized = cv2.resize(heatmap, (224, 224))
-    
     heatmap_uint8 = (heatmap_resized * 255).astype(np.uint8)
-    
     colored_heatmap = cv2.applyColorMap(heatmap_uint8, cv2.COLORMAP_JET)
     
     if len(original_img.shape) == 2:
         original_3ch = cv2.cvtColor(original_img, cv2.COLOR_GRAY2BGR)
-    else:
+    elif len(original_img.shape) == 3 and original_img.shape[2] == 3:
         original_3ch = original_img
+    else:
+        original_3ch = cv2.cvtColor(original_img, cv2.COLOR_RGB2BGR)
     
     overlay = cv2.addWeighted(original_3ch, 1-alpha, colored_heatmap, alpha, 0)
-    
     return overlay
 
+model_instance = AdvancedCheXModel()
+
 def predict(image_bytes, heatmap_method='gradcam'):
-    """
-    Enhanced prediction function with better heatmap generation
-    
-    Args:
-        image_bytes: Image data
-        heatmap_method: 'gradcam', 'integrated_gradients', or 'saliency'
-    """
-    img = Image.open(io.BytesIO(image_bytes)).convert("L")
-    transform = transforms.Compose([
-        transforms.Resize((224, 224)),
-        transforms.ToTensor()
-    ])
-    img_tensor = transform(img).unsqueeze(0)
-    img_array = img_tensor.numpy()
-    img_array = xrv.datasets.normalize(img_array, 255)
-    img_tensor = torch.from_numpy(img_array).float()
-
-    with torch.no_grad():
-        preds = model(img_tensor)
-    probabilities = preds[0].cpu().numpy()
-
-    labels = model.pathologies
-    results = list(zip(labels, probabilities))
-    results.sort(key=lambda x: -x[1])
-
     try:
-        heatmap, target_class = generate_multiple_heatmaps(img_tensor.clone(), method=heatmap_method)
+        predictions = model_instance.predict(image_bytes)
         
-        original = np.array(img.resize((224, 224)))
-        overlayed = create_better_overlay(original, heatmap)
+        heatmap_base64 = None
+        target_class_name = "N/A"
         
-        _, buffer = cv2.imencode('.png', overlayed)
-        heatmap_base64 = base64.b64encode(buffer).decode('utf-8')
+        if predictions and heatmap_method == 'gradcam':
+            try:
+                img_tensor, original_img = model_instance.preprocess_image(image_bytes)
+                
+                top_class_name = predictions[0]['label']
+                class_idx = model_instance.class_names.index(top_class_name)
+                
+                grad_cam = GradCAM(model_instance.model)
+                heatmap = grad_cam.generate_cam(img_tensor, class_idx)
+                
+                overlayed = create_better_overlay(original_img, heatmap)
+                
+                _, buffer = cv2.imencode('.png', overlayed)
+                heatmap_base64 = base64.b64encode(buffer).decode('utf-8')
+                target_class_name = top_class_name
+                
+            except Exception as e:
+                print(f"Heatmap generation failed: {e}")
         
-        target_class_name = labels[target_class] if target_class < len(labels) else "Unknown"
+        return {
+            "predictions": predictions,
+            "heatmap": heatmap_base64,
+            "heatmap_target_class": target_class_name,
+            "heatmap_method": heatmap_method
+        }
         
     except Exception as e:
-        print(f"Heatmap generation failed: {e}")
-        heatmap_base64 = None
-        target_class_name = "Error"
-
-    return {
-        "predictions": [{"label": l, "probability": float(p)} for l, p in results],
-        "heatmap": heatmap_base64,
-        "heatmap_target_class": target_class_name,
-        "heatmap_method": heatmap_method
-    }
-
+        print(f"Prediction failed: {e}")
+        return {
+            "predictions": [],
+            "heatmap": None,
+            "heatmap_target_class": "Error",
+            "heatmap_method": heatmap_method,
+            "error": str(e)
+        }
